@@ -35,3 +35,50 @@ Fill in the topic and IP under preferences and save
 Click Initialize and the states should start populating
 
 You can create a dashboard and display the WATTS_Summary
+
+
+ Current States
+Show raw names
+AC_watts	
+0
+Den/ DR/ Sink Lights_watts	
+0.21041
+Dishwasher_watts	
+0.00249
+Dryer_watts	
+0.00439
+Family Rm_watts	0.01868
+Foyer/ Kitchen Lights_watts	0
+Fridge/ Floor Outlets_watts	0.00582
+Furnace_watts	0.01966
+Kitchen Outlets_watts	0.00481
+Laundry/ Garage_watts	0.00978
+Main Bath/ LR_watts	0.02055
+Main A_watts	0.30206
+Main B_watts	0.27746
+Master/ Blue Beds_watts	0.09217
+Microwave_watts	0
+Other_watts	0.16619
+Rec Rm/ Low Deck_watts	0.01428
+Stove_watts	0
+Washer_watts	0.01029
+
+**Sorted**
+Main: 0.580W
+Den/DR/Sink Lights: 0.210W
+Other: 0.166W
+Master/Blue Beds: 0.092W
+Main Bath/LR: 0.021W
+Furnace: 0.020W
+Family Rm: 0.019W
+RecRm/Low Deck: 0.014W
+Washer: 0.010W
+Laundry/Garage: 0.010W
+Fridge/Floor Outlets: 0.006W
+Kitchen Outlets: 0.005W
+Dryer: 0.004W
+Dishwasher: 0.002W
+AC: 0.000W
+Foyer/Kitchen Lights: 0.000W
+Microwave: 0.000W
+Stove: 0.000W
