@@ -3,6 +3,7 @@ install the hardware and the SEM-METER app on your phone
 To setup MQTT, go to settings (upper right), Home Assistant, then click User Your Own Server  then fill in IP of mqtt server (i.e.  mqtt://IP_of_PC_w_docker_and_broker    port:1883)
 I skipped passwords but up to you
 
+Setup the broker per the pdf instructions
 See that the broker sees items from the Fusion Energy device by opening a PowerShell and run:  docker exec -it mosquitto mosquitto_sub -h localhost -t "#" -v
 
 Look for something like
