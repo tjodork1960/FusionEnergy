@@ -4,6 +4,7 @@ To setup MQTT, go to settings (upper right), Home Assistant, then click User You
 I skipped passwords but up to you
 
 Setup the broker per the pdf instructions
+
 See that the broker sees items from the Fusion Energy device by opening a PowerShell and run:  docker exec -it mosquitto mosquitto_sub -h localhost -t "#" -v
 
 Look for something like
