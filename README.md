@@ -16,6 +16,7 @@ You need the **SEMMETER/94A9900AD2F2/HA**   to fill in as the TOPIC in the devic
 
 
 Install the driver code in Hubitat
+
 Currently the devices are hard coded so you will have to change the following to match your devices
                 def labelMap = [
                     0:"Furnace", 1:"Stove", 2:"Main Bath/LR", 3:"AC",
