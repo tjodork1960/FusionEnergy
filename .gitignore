@@ -15,4 +15,5 @@ wal/
 # Old/backup files
 **/*.bak
 **/mqtt_influx_bridge.py
+**/hubitat_mqtt_bridge.py
 **/mqtt_influxdb_bridge.log*
