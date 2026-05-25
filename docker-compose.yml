@@ -1,0 +1,67 @@
+version: "3.9"
+
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2.0
+    container_name: mosquitto
+    ports:
+      - "1883:1883"
+      - "9001:9001"
+    volumes:
+      - ./mosquitto/config:/mosquitto/config   # bind mount for config
+      - mosquitto_data:/mosquitto/data         # named volume for persistent messages
+      - mosquitto_log:/mosquitto/log           # named volume for logs
+    command: mosquitto -c /mosquitto/config/mosquitto.conf
+    networks:
+      - fusionnet
+    restart: unless-stopped
+
+  mqtt_prometheus_bridge:
+    build:
+      context: ./mqtt_prometheus_bridge
+    container_name: mqtt-prometheus-bridge
+    restart: unless-stopped
+    volumes:
+      - /c/docker/fusionenergy-stack/meter.txt:/meter.txt:ro  #Set-Content -Path "C:\docker\fusionenergy-stack\meter.txt" -Value "97996" -Encoding Ascii
+      - /c/docker/fusionenergy-stack/meter_state.json:/meter_state.json #Set-Content -Path "C:\docker\fusionenergy-stack\meter_state.json" -Value "{}" -Encoding Ascii
+      - /c/docker/fusionenergy-stack/log_config.json:/config/log_config.json:ro
+      - /c/docker/fusionenergy-stack/mqtt_prometheus_bridge:/mqtt_logs
+    ports:
+      - "8000:8000"  # Expose Prometheus metrics for Grafana Agent
+    depends_on:
+      - mosquitto
+    networks:
+      - fusionnet
+
+  hubitat_sensor_bridge:
+    build:
+      context: ./hubitat_sensor_bridge
+    container_name: hubitat-sensor-bridge
+    restart: unless-stopped
+    ports:
+      - "8001:8001"  # Prometheus metrics scraped by Grafana Agent
+    depends_on:
+      - mosquitto
+    networks:
+      - fusionnet
+
+  grafana-agent:
+    image: grafana/agent:latest
+    container_name: grafana-agent
+    restart: unless-stopped
+    volumes:
+      - ./grafana-agent.yaml:/etc/agent.yaml:ro
+      - ./wal:/tmp/grafana-agent-wal
+    command: --config.file=/etc/agent.yaml
+    networks:
+      - fusionnet
+    depends_on:
+      - mqtt_prometheus_bridge
+
+networks:
+  fusionnet:
+    driver: bridge
+
+volumes:
+  mosquitto_data:
+  mosquitto_log:

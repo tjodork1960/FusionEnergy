@@ -1,0 +1,12 @@
+# -------------------------------------------------------------------------
+# hubitat_sensor_bridge.py.example
+#
+# Copy this to hubitat_sensor_bridge.py and fill in your Hubitat hub ID.
+#
+# Find your hub ID:
+#   - Open Hubitat → Apps → MQTT → check the topic prefix it publishes to
+#   - Or watch MQTT traffic: mosquitto_sub -t "hubitat/#" -v
+#   - It typically looks like: hubitat/YOUR-HUB-ID/device-name/attribute
+# -------------------------------------------------------------------------
+
+MQTT_SUB_TOPIC = "hubitat/YOUR-HUB-ID/+/+"

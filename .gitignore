@@ -1,0 +1,18 @@
+# Live credentials — copy the .example versions and fill in your own values
+grafana-agent.yaml
+mqtt_prometheus_bridge/mqtt_prometheus_bridge.py
+hubitat_sensor_bridge/hubitat_sensor_bridge.py
+
+# Personal meter readings
+meter.txt
+meter_state.json
+
+# Runtime data
+mosquitto/data/
+mosquitto/log/
+wal/
+
+# Old/backup files
+**/*.bak
+**/mqtt_influx_bridge.py
+**/mqtt_influxdb_bridge.log*

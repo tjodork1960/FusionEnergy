@@ -1,0 +1,22 @@
+metrics:
+  wal_directory: /tmp/grafana-agent-wal
+  global:
+    scrape_interval: 60s
+
+  configs:
+    - name: mqtt_bridge
+      scrape_configs:
+        - job_name: mqtt_bridge
+          static_configs:
+            - targets: ["mqtt-prometheus-bridge:8000"]
+        - job_name: hubitat_sensors
+          static_configs:
+            - targets: ["hubitat-sensor-bridge:8001"]
+        - job_name: node
+          static_configs:
+            - targets: ["localhost:9090"]
+      remote_write:
+        - url: https://prometheus-prod-XX-prod-us-REGION.grafana.net/api/prom/push
+          basic_auth:
+            username: YOUR_GRAFANA_CLOUD_USERNAME
+            password: YOUR_GRAFANA_CLOUD_API_KEY

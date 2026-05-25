@@ -1,0 +1,55 @@
+# -------------------------------------------------------------------------
+# mqtt_prometheus_bridge.py.example
+#
+# Copy this to mqtt_prometheus_bridge.py and fill in:
+#   1. Your SEM device MAC addresses (find them in the SEM meter app or
+#      by watching MQTT traffic: mosquitto_sub -t "SEMMETER/#" -v)
+#   2. Your circuit names for each CT channel (1-indexed, 1-19)
+#      Use "NA" for unused channels.
+#      Pairs ending in -A / -B are automatically merged (e.g. Main-A + Main-B → Main)
+# -------------------------------------------------------------------------
+
+ct_mappings = {
+    "YOUR_SEM_DEVICE_MAC_1": {
+        1:  "Circuit Name 1",
+        2:  "Circuit Name 2",
+        3:  "Circuit Name 3",
+        4:  "Circuit Name 4",
+        5:  "Circuit Name 5",
+        6:  "Circuit Name 6",
+        7:  "Circuit Name 7",
+        8:  "Circuit Name 8",
+        9:  "Circuit Name 9",
+        10: "Circuit Name 10",
+        11: "Circuit Name 11",
+        12: "Circuit Name 12",
+        13: "Circuit Name 13",
+        14: "Circuit Name 14",
+        15: "Circuit Name 15",
+        16: "NA",
+        17: "NA",
+        18: "Main-A",    # ← always name your mains -A / -B so they merge
+        19: "Main-B",
+    },
+    "YOUR_SEM_DEVICE_MAC_2": {
+        1:  "Circuit Name 1",
+        2:  "Circuit Name 2",
+        3:  "Circuit Name 3",
+        4:  "Circuit Name 4",
+        5:  "Circuit Name 5",
+        6:  "Circuit Name 6",
+        7:  "Circuit Name 7",
+        8:  "Circuit Name 8",   # e.g. "AC-A"
+        9:  "Circuit Name 9",   # e.g. "AC-B"  → merged to "AC"
+        10: "Circuit Name 10",
+        11: "Circuit Name 11",
+        12: "Circuit Name 12",
+        13: "Circuit Name 13",
+        14: "Circuit Name 14",
+        15: "Circuit Name 15",
+        16: "NA",
+        17: "Main2-A",
+        18: "Main2-B",
+        19: "NA",
+    },
+}

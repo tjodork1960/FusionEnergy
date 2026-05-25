@@ -1,0 +1,18 @@
+{
+  "log_hubitat": true,
+  "log_hubitat_dishwasher": false,
+  "log_influx": false,
+  "log_grafana": false,
+  "log_projected": true,
+  "log_power_shouldwrite": false,
+  "log_energy_shouldwrite": false,
+  "log_shouldNOTwrite": false,
+  "log_gotmessage": false,
+  "log_senseblock1": false,
+  "log_senseblock2": false,
+  "log_senseblock_ct": "",
+  "log_projected_last_delta": false
+
+}
+
+ 
