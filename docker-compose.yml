@@ -22,12 +22,24 @@ services:
     container_name: mqtt-prometheus-bridge
     restart: unless-stopped
     volumes:
-      - /c/docker/fusionenergy-stack/meter.txt:/meter.txt:ro  #Set-Content -Path "C:\docker\fusionenergy-stack\meter.txt" -Value "97996" -Encoding Ascii
-      - /c/docker/fusionenergy-stack/meter_state.json:/meter_state.json #Set-Content -Path "C:\docker\fusionenergy-stack\meter_state.json" -Value "{}" -Encoding Ascii
-      - /c/docker/fusionenergy-stack/log_config.json:/config/log_config.json:ro
-      - /c/docker/fusionenergy-stack/mqtt_prometheus_bridge:/mqtt_logs
+      - ./meter.txt:/meter.txt:ro                      # create first - see README step 4
+      - ./meter_state.json:/meter_state.json
+      - ./daily_meter_state.json:/daily_meter_state.json
+      - ./log_config.json:/config/log_config.json:ro
+      - ./mqtt_prometheus_bridge:/mqtt_logs
     ports:
       - "8000:8000"  # Expose Prometheus metrics for Grafana Agent
+    # All optional - uncomment and fill in to enable.
+    # environment:
+    #   # Email alert when a SEM meter stops publishing (Gmail + app password)
+    #   - ALERT_EMAIL_FROM=you@gmail.com
+    #   - ALERT_EMAIL_APP_PASSWORD=your-gmail-app-password
+    #   - ALERT_EMAIL_TO=you@gmail.com
+    #   # Dead-man's-switch ping (e.g. a healthchecks.io check URL)
+    #   - HEALTHCHECK_PING_URL=https://hc-ping.com/your-check-uuid
+    #   # How often readings go to Hubitat - raise these to lower hub load
+    #   - HUBITAT_MIN_INTERVAL=30
+    #   - HUBITAT_POWER_THRESHOLD=0.30
     depends_on:
       - mosquitto
     networks:

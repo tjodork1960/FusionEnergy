@@ -2,54 +2,1038 @@
 # mqtt_prometheus_bridge.py.example
 #
 # Copy this to mqtt_prometheus_bridge.py and fill in:
-#   1. Your SEM device MAC addresses (find them in the SEM meter app or
-#      by watching MQTT traffic: mosquitto_sub -t "SEMMETER/#" -v)
-#   2. Your circuit names for each CT channel (1-indexed, 1-19)
+#   1. Your SEM device MAC addresses in ct_mappings (find them by watching
+#      MQTT traffic: mosquitto_sub -t "SEMMETER/#" -v). They also appear in
+#      the log_senseblock1/2 check in process_queue().
+#   2. Your circuit names for each CT channel (1-indexed, 1-19).
 #      Use "NA" for unused channels.
-#      Pairs ending in -A / -B are automatically merged (e.g. Main-A + Main-B → Main)
+#      Pairs ending in -A / -B are automatically merged (e.g. Main-A + Main-B -> Main)
+#   3. Your utility's electricity rates (RATE_* below) for the cost metrics.
+#
+# Optional environment variables (set in docker-compose.yml):
+#   ALERT_EMAIL_FROM / ALERT_EMAIL_APP_PASSWORD / ALERT_EMAIL_TO
+#       Gmail sender + app password for "SEM meter stopped publishing"
+#       alerts. Leave unset to disable email alerts.
+#   HEALTHCHECK_PING_URL  - healthchecks.io-style URL pinged every 10 min
+#   HUBITAT_POWER_THRESHOLD, HUBITAT_MIN_POWER_DELTA, HUBITAT_MIN_ENERGY_DELTA,
+#   HUBITAT_MIN_INTERVAL, HUBITAT_SPIKE_DELTA, BACKUP_HUBITAT
+#       How often readings are forwarded to Hubitat (see the comment block
+#       further down) - the defaults keep hub load low.
 # -------------------------------------------------------------------------
+from prometheus_client import start_http_server, Gauge
+# to update the meter reading:  Set-Content -Path ".\meter.txt" -Value "12345" -Encoding Ascii
 
+# Start metrics server on port 8000
+start_http_server(8000, addr="0.0.0.0")
+# Define metrics
+power_metric = Gauge('ct_power_watts', 'Power usage in watts', ['ct_name'])
+energy_metric = Gauge('ct_energy_kwh', 'Energy usage in kWh', ['ct_name'])
+cost_metric = Gauge('ct_cost_dollars', 'Energy cost in dollars', ['ct_name'])
+
+# --- Residential TOU (Time-of-Use) rate schedule ---
+# EXAMPLE VALUES - replace with your own utility's $/kWh rates and peak
+# windows (and adjust get_rate_per_kwh below if your windows differ).
+RATE_OFF_PEAK = 0.08295            # all days/seasons, midnight-8am & 10pm-midnight
+RATE_ON_PEAK_SUMMER = 0.20154      # Jun-Sep, 8am-4pm & 8-10pm, every day (weekday and weekend)
+RATE_SUPER_PEAK_SUMMER = 0.33885   # Jun-Sep, 4-8pm, weekdays only
+RATE_ON_PEAK_NON_SUMMER = 0.16366  # Oct-May, 8am-10pm, every day (no super-peak tier at all)
+SUMMER_MONTHS = (6, 7, 8, 9)
+
+
+def get_rate_per_kwh(dt):
+    """$/kWh for the given local datetime, per the TOU schedule above."""
+    hour = dt.hour
+    if hour < 8 or hour >= 22:
+        return RATE_OFF_PEAK
+    is_summer = dt.month in SUMMER_MONTHS
+    is_weekday = dt.weekday() < 5  # Monday=0 .. Sunday=6
+    if is_summer:
+        if is_weekday and 16 <= hour < 20:
+            return RATE_SUPER_PEAK_SUMMER
+        return RATE_ON_PEAK_SUMMER
+    return RATE_ON_PEAK_NON_SUMMER
+
+##NOTE all power logging is done  in Watts
+##NOTE all energy logging is done in KWh
+# add counter 
+# add logging and handling power resetting
+# dont log spikes for mains
+# dont log faster than 8 seconds per CT
+import json
+import time
+import paho.mqtt.client as mqtt
+from collections import deque
+from datetime import datetime
+from zoneinfo import ZoneInfo
+import os
+import uuid
+import socket
+import queue
+import threading
+import logging
+from logging.handlers import RotatingFileHandler
+import pytz
+import smtplib
+from email.mime.text import MIMEText
+
+os.makedirs('/app/logs', exist_ok=True)
+
+class LocalTimeFormatter(logging.Formatter):
+    def converter(self, timestamp):
+        dt = datetime.utcfromtimestamp(timestamp)
+        local_tz = pytz.timezone("America/Chicago")
+        return pytz.utc.localize(dt).astimezone(local_tz).timetuple()
+
+    def formatTime(self, record, datefmt=None):
+        ct = self.converter(record.created)
+        return time.strftime(datefmt or "%Y-%m-%d %H:%M:%S", ct)
+
+def setup_logging(
+    log_file='/mqtt_logs/mqtt_prometheus_bridge.log',
+    max_bytes=5 * 1024 * 1024,  # 5 MB
+    backup_count=3,
+    level=logging.INFO
+):
+    # Clear existing handlers to avoid duplicates
+    logger = logging.getLogger()
+    logger.setLevel(level)
+    logger.handlers.clear()
+    logger.propagate = False
+
+    # Create formatter
+    formatter = LocalTimeFormatter(
+        fmt="%(asctime)s - %(levelname)s - %(message)s",
+        datefmt="%Y-%m-%d %I:%M:%S %p"
+    )
+
+    # File handler with rotation
+    file_handler = RotatingFileHandler(log_file, maxBytes=max_bytes, backupCount=backup_count)
+    file_handler.setFormatter(formatter)
+
+    # Console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+
+    # Attach handlers
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+
+    return logger
+
+# Example log
+logger = setup_logging()
+logger.info("mqtt_prometheus_bridge.py started")
+
+
+
+central = pytz.timezone('America/Chicago')
+current_time = datetime.now(central).strftime("%Y-%m-%d %H:%M:%S")
+print("Central Time:", current_time)
+
+METER_FILE_PATH = "/meter.txt"
+STATE_FILE_PATH = "/meter_state.json"
+
+manual_meter_kwh = manual_timestamp = manual_energy_baseline = None
+
+print("Starting mqtt-prometheus-bridge...")
+
+# --- MQTT config ---
+MQTT_BROKER = os.getenv("MQTT_BROKER", "mosquitto")
+MQTT_PORT = 1883
+MQTT_SUB_TOPIC = "SEMMETER/+/HA"
+
+# --- CT name mappings per SEMMETER ---  Note they are **1** based to match CT's-  
 ct_mappings = {
     "YOUR_SEM_DEVICE_MAC_1": {
-        1:  "Circuit Name 1",
-        2:  "Circuit Name 2",
-        3:  "Circuit Name 3",
-        4:  "Circuit Name 4",
-        5:  "Circuit Name 5",
-        6:  "Circuit Name 6",
-        7:  "Circuit Name 7",
-        8:  "Circuit Name 8",
-        9:  "Circuit Name 9",
-        10: "Circuit Name 10",
-        11: "Circuit Name 11",
-        12: "Circuit Name 12",
-        13: "Circuit Name 13",
-        14: "Circuit Name 14",
-        15: "Circuit Name 15",
-        16: "NA",
-        17: "NA",
-        18: "Main-A",    # ← always name your mains -A / -B so they merge
-        19: "Main-B",
+        1: "Circuit Name 1", 2: "Circuit Name 2", 3: "Circuit Name 3", 4: "Circuit Name 4",
+        5: "Circuit Name 5", 6: "Circuit Name 6", 7: "Circuit Name 7", 8: "Circuit Name 8",
+        9: "Circuit Name 9", 10: "Circuit Name 10", 11: "Circuit Name 11", 12: "Circuit Name 12",
+        13: "Circuit Name 13", 14: "Circuit Name 14", 15: "Circuit Name 15",
+        16: "NA", 17: "NA", 18: "Main-A", 19: "Main-B"
     },
     "YOUR_SEM_DEVICE_MAC_2": {
-        1:  "Circuit Name 1",
-        2:  "Circuit Name 2",
-        3:  "Circuit Name 3",
-        4:  "Circuit Name 4",
-        5:  "Circuit Name 5",
-        6:  "Circuit Name 6",
-        7:  "Circuit Name 7",
-        8:  "Circuit Name 8",   # e.g. "AC-A"
-        9:  "Circuit Name 9",   # e.g. "AC-B"  → merged to "AC"
-        10: "Circuit Name 10",
-        11: "Circuit Name 11",
-        12: "Circuit Name 12",
-        13: "Circuit Name 13",
-        14: "Circuit Name 14",
-        15: "Circuit Name 15",
-        16: "NA",
-        17: "Main2-A",
-        18: "Main2-B",
-        19: "NA",
+        1: "Circuit Name 1", 2: "Circuit Name 2", 3: "Circuit Name 3", 4: "Circuit Name 4",
+        5: "Circuit Name 5", 6: "Circuit Name 6", 7: "Circuit Name 7", 8: "Circuit Name 8",
+        9: "Circuit Name 9", 10: "Circuit Name 10", 11: "Circuit Name 11", 12: "Circuit Name 12",
+        13: "Circuit Name 13", 14: "Circuit Name 14", 15: "Circuit Name 15",
+        16: "NA", 17: "Main2-A", 18: "Main2-B", 19: "NA"
     },
 }
+
+# --- Validate CT mappings ---
+for dev_id, ct_map in ct_mappings.items():
+    # Skip channel 0 if your mappings start at 1
+    missing = [i for i in range(1, 20) if i not in ct_map]
+    if missing:
+        logger.warning(f"{dev_id} missing CT mappings: {missing}")
+
+# --- Per-meter MQTT staleness alerting ---
+# Emails when a SEM meter stops publishing for longer than the threshold
+# (they normally publish about every 2s), and again when it resumes.
+# Checked per device id, so one silent meter can't be masked by other
+# MQTT traffic.
+SMTP_HOST = "smtp.gmail.com"
+SMTP_PORT = 587
+ALERT_EMAIL_FROM = os.environ.get("ALERT_EMAIL_FROM", "")  # unset = alerts disabled
+ALERT_EMAIL_APP_PASSWORD = os.environ.get("ALERT_EMAIL_APP_PASSWORD", "")
+ALERT_EMAIL_TO = os.environ.get("ALERT_EMAIL_TO", ALERT_EMAIL_FROM)
+SEM_STALE_THRESHOLD_SECONDS = 30
+SEM_CHECK_INTERVAL_SECONDS = 10
+SEM_STARTUP_GRACE_SECONDS = 60  # don't alert on "never seen" until well past normal startup
+
+sem_last_seen = {dev_id: None for dev_id in ct_mappings}
+sem_alert_stale = {dev_id: False for dev_id in ct_mappings}
+_sem_start_time = time.time()
+
+# healthchecks.io dead-man's-switch for this process itself.
+# Everything above only watches whether the METERS are still publishing;
+# nothing previously watched whether this bridge process is even alive.
+# Empty disables it.
+HEALTHCHECK_PING_URL = os.environ.get("HEALTHCHECK_PING_URL", "")
+HEALTHCHECK_PING_INTERVAL_SECONDS = int(os.environ.get("HEALTHCHECK_PING_INTERVAL_SECONDS", "600"))
+
+
+def ping_healthcheck_loop():
+    import urllib.request
+    while True:
+        if HEALTHCHECK_PING_URL:
+            try:
+                urllib.request.urlopen(HEALTHCHECK_PING_URL, timeout=10)
+            except Exception as e:
+                logger.warning(f"healthchecks.io ping failed: {e}")
+        time.sleep(HEALTHCHECK_PING_INTERVAL_SECONDS)
+
+
+def send_alert_email(subject: str, body: str) -> None:
+    if not (ALERT_EMAIL_FROM and ALERT_EMAIL_APP_PASSWORD):
+        logger.warning(f"Alert (email not configured): {subject}")
+        return
+    msg = MIMEText(body)
+    msg["Subject"] = subject
+    msg["From"] = ALERT_EMAIL_FROM
+    msg["To"] = ALERT_EMAIL_TO
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+            server.starttls()
+            server.login(ALERT_EMAIL_FROM, ALERT_EMAIL_APP_PASSWORD)
+            server.sendmail(ALERT_EMAIL_FROM, [ALERT_EMAIL_TO], msg.as_string())
+        logger.info(f"Sent alert email: {subject}")
+    except Exception as e:
+        logger.warning(f"send_alert_email failed: {e}")
+
+
+def check_sem_staleness():
+    while True:
+        time.sleep(SEM_CHECK_INTERVAL_SECONDS)
+        now = time.time()
+        if now - _sem_start_time < SEM_STARTUP_GRACE_SECONDS:
+            continue
+        for dev_id, last_seen in sem_last_seen.items():
+            age = (now - last_seen) if last_seen is not None else float("inf")
+            is_stale = age > SEM_STALE_THRESHOLD_SECONDS
+            if is_stale and not sem_alert_stale[dev_id]:
+                sem_alert_stale[dev_id] = True
+                age_txt = "never seen since startup" if last_seen is None else f"{age:.0f}s ago"
+                send_alert_email(
+                    f"SEM meter {dev_id}: no MQTT data",
+                    f"SEM meter {dev_id} has stopped publishing to SEMMETER/{dev_id}/HA.\n"
+                    f"Last message: {age_txt}\n"
+                    f"Threshold: {SEM_STALE_THRESHOLD_SECONDS}s\n",
+                )
+            elif not is_stale and sem_alert_stale[dev_id]:
+                sem_alert_stale[dev_id] = False
+                send_alert_email(
+                    f"SEM meter {dev_id}: back to normal",
+                    f"SEM meter {dev_id} has resumed publishing to SEMMETER/{dev_id}/HA.\n",
+                )
+
+
+# --- Threshold & backup config ---
+POWER_THRESHOLD = 0.15       # 10% for power    was .10 but den was changing too much
+ENERGY_THRESHOLD = 0.05      # 5% for energy_in
+MIN_POWER_DELTA = 15         # in watts       was 10 but den was changing too much
+MIN_ENERGY_DELTA = 5         # in energy units
+SPIKE_THRESHOLD_POWER = 20.0
+SPIKE_THRESHOLD_ENERGY = 5.0
+
+BACKUP_INTERVAL = 180
+MIN_INTERVAL = 8
+ROLLING_AVG_WINDOW = 3
+
+# --- Hubitat-specific throttling (2026-08-13) ---
+# Everything above decides what's worth recording in Prometheus.
+# The hub is a different kind of consumer and needs its own, much wider,
+# decision.
+#
+# Why: the hub's App Statistics showed MQTT Link at 23% of app CPU on
+# 57,552 events - the single largest consumer - and every message we
+# publish here makes a Fusion CT child device parse JSON, set attributes
+# and fire events, which MQTT Link then republishes outward, and which any
+# subscribed rule then re-evaluates. Measured 16 msg/min (~23,000/day)
+# going into the hub. Grafana wants resolution; the hub only needs numbers
+# good enough for floorplan tiles and rules, so it no longer gets a message
+# every time Prometheus does.
+#
+# Deliberately compared against the last value the HUB was sent, not the
+# last value Prometheus was sent - otherwise a series of small changes, each
+# below the hub's deadband, would never accumulate into a send and the hub
+# could drift arbitrarily far from reality.
+#
+# Env-overridable so these can be tuned against the hub's own statistics
+# page without a rebuild.
+HUBITAT_POWER_THRESHOLD = float(os.getenv("HUBITAT_POWER_THRESHOLD", "0.30"))   # vs 0.15 for Prometheus
+HUBITAT_MIN_POWER_DELTA = float(os.getenv("HUBITAT_MIN_POWER_DELTA", "50"))     # watts, vs 15
+HUBITAT_MIN_ENERGY_DELTA = float(os.getenv("HUBITAT_MIN_ENERGY_DELTA", "10"))   # vs 5
+HUBITAT_MIN_INTERVAL = float(os.getenv("HUBITAT_MIN_INTERVAL", "30"))           # seconds, vs 8
+# Absolute change that always goes through, whatever the percentage - the
+# same idea as SPIKE_THRESHOLD_POWER above. Without it, requiring both a
+# percentage and a delta means big circuits get worse service than small
+# ones: 30% of a 3kW Main is a 900W swing, so a whole appliance could
+# switch on and the hub would not be told until the heartbeat.
+HUBITAT_SPIKE_DELTA = float(os.getenv("HUBITAT_SPIKE_DELTA", "100"))            # watts
+# Heartbeat: every CT is sent at least this often even when nothing has
+# changed, so the hub can't go stale. Raised from 300s - at 14 CTs that
+# floor alone was ~168 messages/hour of "nothing happened".
+BACKUP_HUBITAT = float(os.getenv("BACKUP_HUBITAT", "600"))
+
+# --- State tracking ---
+last_sent_values = {}
+last_sent_time = {}
+rolling_buffers = {}
+last_hubitat_sent = {}
+# The last power/energy_in actually PUBLISHED to the hub, per CT - the
+# baseline should_send_to_hubitat() measures against. Distinct from
+# last_sent_values, which tracks what Prometheus was told.
+last_hubitat_values = {}
+last_interval_count = {}
+hubitat_mqtt_counter = 0
+
+# --State tracking for meter readings
+manual_meter_kwh = None
+manual_timestamp = None
+latest_main_energy_in = None
+latest_main_energy_in_old = None
+latest_energy_timestamp = None
+manual_energy_baseline = None  # main_energy_in at time of manual reading
+last_published_int = None
+projected_ct_name = "ProjectedMeter"
+#counter
+send_hubitat_counter=0
+last_sent_hubitat_counter=0
+
+# --- State tracking for daily (resets at local midnight) energy ---
+# Built on top of projected_meter (the already recalibrated whole-home
+# total) rather than the raw CT energy_in, so a CT reset mid-day doesn't
+# also need its own reset-detection logic here - projected_meter already
+# absorbed that. daily_baseline_kwh is projected_meter's value as of the
+# most recent local midnight; daily_energy_kwh = projected_meter -
+# daily_baseline_kwh is "how much used so far today".
+DAILY_STATE_FILE_PATH = "/daily_meter_state.json"
+daily_ct_name = "DailyEnergy"
+daily_baseline_kwh = None
+daily_baseline_date = None  # "YYYY-MM-DD" in America/Chicago, the day this baseline was captured
+last_published_daily = None
+
+# --- State tracking for daily (resets at local midnight) cost ---
+# Unlike daily_energy_kwh, cost can't be computed as a simple "now minus
+# midnight baseline" subtraction, because the $/kWh rate changes throughout
+# the day (see get_rate_per_kwh) - it has to be integrated incrementally:
+# each cycle, whatever energy delta occurred since the last cycle gets
+# multiplied by whatever rate was active *at that moment* and added to a
+# running total. daily_cost_last_energy is the projected_meter reading as
+# of the last time that integration ran (distinct from daily_baseline_kwh,
+# which only marks the midnight starting point).
+daily_cost_ct_name = "DailyCost"
+daily_cost_dollars = None
+daily_cost_last_energy = None
+last_published_daily_cost = None
+
+# --- Queue for incoming messages ---
+msg_queue = queue.Queue()
+
+# --- Helper functions ---
+def round_fields(fields: dict, precision: int = 3) -> dict:
+    return {k: round(v, precision) if isinstance(v, float) else v for k, v in fields.items()}
+
+def smooth_value(metric_key, value):
+    buffer = rolling_buffers.setdefault(metric_key, deque(maxlen=ROLLING_AVG_WINDOW))
+    buffer.append(value)
+    return sum(buffer) / len(buffer)
+
+def log_counter():
+    global hubitat_mqtt_counter,last_sent_hubitat_counter
+    while True:
+        time.sleep(180)  # 3 minutes = 180 seconds
+        if hubitat_mqtt_counter>last_sent_hubitat_counter:
+            logger.info(f" *************************** Hubitat mqtt counter value: {hubitat_mqtt_counter}")
+            last_sent_hubitat_counter=hubitat_mqtt_counter
+
+def load_log_flags():
+    try:
+        with open("/config/log_config.json") as f:
+            return json.load(f)
+    except Exception as e:
+        logger.warning(f"Failed to load log config: {e}")
+        return {}
+
+def should_send_to_hubitat(ct_name, metrics, now_time):
+    """Whether this CT's reading is worth waking the hub up for.
+
+    Returns (bool, reason). Applied on top of should_write(): a reading has
+    to be worth recording in Prometheus *and* clear this wider bar before it
+    is published to Hubitat. The periodic BACKUP_HUBITAT sweep guarantees
+    the hub still hears from every CT regularly regardless, so anything
+    rejected here is genuinely redundant rather than lost.
+    """
+    # "Never sent" is checked before the rate limit on purpose: a CT the hub
+    # has no value for at all should go out immediately, not wait out an
+    # interval it was never part of.
+    previous = last_hubitat_values.get(ct_name)
+    if previous is None:
+        return True, "initial"
+
+    if now_time - last_hubitat_sent.get(ct_name, 0) < HUBITAT_MIN_INTERVAL:
+        return False, "too fast for hub"
+
+    power = metrics.get("power", 0.0)
+    energy = metrics.get("energy_in", 0.0)
+    power_delta = abs(power - previous.get("power", 0.0))
+    energy_delta = abs(energy - previous.get("energy_in", 0.0))
+    power_pct = (power_delta / max(abs(previous.get("power", 0.0)), 1e-6)) * 100
+
+    # A big absolute swing always counts - an appliance starting up matters
+    # on a 3kW main just as much as on a 200W circuit, and the percentage
+    # test alone would hide it.
+    if power_delta >= HUBITAT_SPIKE_DELTA:
+        return True, f"power spike +/-{power_delta:.0f}W"
+    # Otherwise percent AND absolute, matching should_write's reasoning: a
+    # 40% jump on a 3W standby load is noise, and a handful of watts on a
+    # big circuit is not worth a message either.
+    if power_delta >= HUBITAT_MIN_POWER_DELTA and power_pct >= HUBITAT_POWER_THRESHOLD * 100:
+        return True, f"power +/-{power_delta:.0f}W ({power_pct:.0f}%)"
+    if energy_delta >= HUBITAT_MIN_ENERGY_DELTA:
+        return True, f"energy +/-{energy_delta:.2f}"
+    return False, "below hub deadband"
+
+
+def should_write(metric_key, value, raw_value=None, precision=3):
+    """
+    Determines whether a metric should be written to Prometheus or MQTT.
+
+    Percent-only without delta does not trigger.
+    Delta-only without percent does not trigger.
+    Spike and time triggers remain unchanged.
+    """
+    now = time.time()
+    last_value = last_sent_values.get(metric_key)
+    last_time = last_sent_time.get(metric_key, 0)
+    smoothed = smooth_value(metric_key, value)
+    raw = raw_value if raw_value is not None else value
+    log_flags = load_log_flags()
+
+    pct_diff = 0
+    abs_diff = 0
+    reason = None
+    write_needed = False
+
+    # Thresholds per metric type
+    if "power" in metric_key:
+        percent_thresh = POWER_THRESHOLD
+        min_delta = MIN_POWER_DELTA
+        spike_thresh = SPIKE_THRESHOLD_POWER
+    else:
+        percent_thresh = ENERGY_THRESHOLD
+        min_delta = MIN_ENERGY_DELTA
+        spike_thresh = SPIKE_THRESHOLD_ENERGY
+
+    if last_value is not None:
+        abs_diff = abs(smoothed - last_value)
+        pct_diff = (abs_diff / max(abs(last_value), 1e-6)) * 100
+
+    # Trigger evaluation
+    if (now - last_time) < MIN_INTERVAL:
+        reason = "too fast"
+        write_needed = False
+    elif last_value is None:
+        reason = "initial"
+        write_needed = True
+    elif ((abs_diff >= spike_thresh) and ("Main" not in metric_key)):
+        reason = "spike"
+        write_needed = True
+    elif (now - last_time) >= BACKUP_INTERVAL:
+        reason = f"time={int(now - last_time)}s"
+        write_needed = True
+    elif pct_diff >= percent_thresh * 100 and abs_diff >= min_delta:
+        reason = "percent+delta"
+        write_needed = True
+    # note: delta-only is now ignored
+
+    # Logging format
+    def fmt(v):
+        return "None" if v is None else f"{v:.{precision}f}"
+
+    last_fmt = fmt(last_value)
+    new_fmt = fmt(smoothed)
+    diff_fmt = fmt(abs_diff)
+    pct_fmt = fmt(pct_diff)
+
+    if write_needed:
+        last_sent_values[metric_key] = smoothed
+        last_sent_time[metric_key] = now
+        if (log_flags.get("log_power_shouldwrite") and "power" in metric_key) or (log_flags.get("log_energy_shouldwrite") and "energy_in" in metric_key):
+            logger.info(f"should_write [{metric_key}] WRITE: last={last_fmt}, new={new_fmt}, diff={diff_fmt}, pct={pct_fmt}%, reason={reason}")
+        return smoothed, pct_diff, abs_diff, reason
+
+        if log_flags.get("log_shouldNOTwrite"): 
+            logger.info(f"should not write [{metric_key}] SKIP: last={last_fmt}, new={new_fmt}, diff={diff_fmt}, pct={pct_fmt}%, reason={reason}")
+
+    return None, None, None, None
+
+def get_ct_name(device_id, ct_index):
+    ct_map = ct_mappings.get(device_id)
+    if ct_map is None:
+        logger.warning(f"Unknown SEMMETER device ID: {device_id}")
+        return f"CT{ct_index}"
+    if ct_index not in ct_map:
+        logger.warning(f"{device_id} missing CT index {ct_index}")
+    return ct_map.get(ct_index, f"CT{ct_index}")
+    
+def log_sense_blocks(device_id, sense_blocks):
+    log_flags = load_log_flags()
+    ct_filter = log_flags.get("log_senseblock_ct")  # e.g., "Dishwasher"
+    printed_header = False 
+
+    field_names = ["ct", "voltage", "current", "power", "energy_in", "energy_out"]
+    widths = [30, 12, 12, 12, 12, 12]  # Wider CT column
+
+    def format_row(values):
+        return " | ".join(f"{str(v):>{w}}" for v, w in zip(values, widths))
+
+    header = f"{format_row(field_names)} for {device_id}:"
+
+    for i, block in enumerate(sense_blocks):
+ 
+        voltage, current, power, energy_in, energy_out = block
+        ct_name = get_ct_name(device_id, i + 1)  # 1-indexed
+
+        # Filter by CT name if specified
+        if ct_filter and ct_name != ct_filter:
+            continue
+
+        row_values = [ct_name, voltage, current, power, energy_in, energy_out]
+        if printed_header is False:       
+            logger.info(header) 
+            printed_header = True
+
+        logger.info(format_row(row_values))
+        
+        
+# --- Worker to process queued messages ---
+def process_queue():
+    from zoneinfo import ZoneInfo
+    central = ZoneInfo("America/Chicago")
+    HUBITAT_TOPIC_PREFIX = "hubitat/sem_meter"
+    global last_hubitat_backup, last_hubitat_sent, last_hubitat_values, send_hubitat_counter,latest_main_energy_in,latest_main_energy_in_old,hubitat_mqtt_counter
+    last_hubitat_backup = 0
+    last_hubitat_sent = {}
+    # Reset alongside last_hubitat_sent - the two are a pair, and starting
+    # empty makes the first reading for each CT publish unconditionally
+    # ("initial"), so the hub is current immediately after a restart.
+    last_hubitat_values = {}
+
+    while True:
+        #msg_payload = msg_queue.get()
+        msg_topic, msg_payload = msg_queue.get()
+        device_id = msg_topic.split("/")[1]  # e.g., "YOUR_SEM_DEVICE_MAC_1"
+        log_flags = load_log_flags()
+        if log_flags.get("log_gotmessage"): 
+            logger.info(f"Got message at {datetime.now(central).strftime('%Y-%m-%d %H:%M:%S %Z')}")
+
+        try:
+            payload = json.loads(msg_payload)
+            sense_blocks = payload.get("sense", [])
+            
+            if ((device_id == "YOUR_SEM_DEVICE_MAC_1") and log_flags.get("log_senseblock1")) or ((device_id == "YOUR_SEM_DEVICE_MAC_2") and log_flags.get("log_senseblock2")):
+                #logger.info(f"[DEBUG] sense_blocks for {device_id}: {json.dumps(sense_blocks, indent=2)}")
+                log_sense_blocks(device_id,sense_blocks)
+                
+
+            # Temporary store for all metrics in this cycle
+            #logger.info(f"Clearing ALLLLLL metrics")
+            all_metrics = {}
+
+            main_power = main_energy_in = 0.0
+
+            for i, block in enumerate(sense_blocks):
+                if not isinstance(block, list) or len(block) < 5:
+                    #print(f"Device ID {device_id} Skipping block {i}: {block}")
+                    continue
+                #print(f"Processing Device ID {device_id} block {i}: {block}")
+
+                #ct_name = ct_names.get(i, f"CT{i+1}")
+                #ct_name = ct_map.get(i, f"CT{i}")
+                ct_name_raw = get_ct_name(device_id, i+1)
+
+                if not ct_name_raw or ct_name_raw == "NA":
+                    continue
+                
+                #logger.info(f"Handling Device ID {device_id}  CTname {ct_name_raw}")
+
+                # Normalize suffixes like "AC-A" → "AC"
+                ct_name = ct_name_raw.rsplit("-", 1)[0] if ct_name_raw.endswith(("-A", "-B")) else ct_name_raw
+
+                # Accumulate metrics
+                if ct_name not in all_metrics:
+                    #logger.info(f"Initializing all_metrics for ct {ct_name}")
+                    all_metrics[ct_name] = {"power": 0.0, "energy_in": 0.0}
+
+                power = block[2] / 100.0
+                energy_in = block[3] / 1000.0
+
+                all_metrics[ct_name]["power"] += power
+                all_metrics[ct_name]["energy_in"] += energy_in
+               
+                #logger.debug(f"{ct_name_raw} → merged as {ct_name}: {power}W, {energy_in}kWh")
+                energy_temp = all_metrics[ct_name]["energy_in"]
+
+                #logger.info(f"Adding to all_metrics with key {ct_name}  allmetrics_energy_in {energy_temp}  {ct_name_raw} → merged as {ct_name}: {power}W, {energy_in}kWh")
+                #logger.warning(f"Available keys: {list(all_metrics.keys())}")
+            now_time = time.time()
+            
+            #grab the latest main energy and timestamp
+            if "Main" in all_metrics and "energy_in" in all_metrics["Main"]:
+                latest_energy_timestamp = time.time()
+                if latest_main_energy_in_old is None:
+                    logger.info(f"Setting latest_main_energy_in to {latest_main_energy_in} and latest_energy_timestamp to {latest_energy_timestamp} ")
+                latest_main_energy_in_old = latest_main_energy_in
+                latest_main_energy_in = all_metrics["Main"]["energy_in"]
+               
+            # else:
+                # logger.warning(f"'Main' not found in metrics. Available keys: {list(all_metrics.keys())}")
+                # latest_main_energy_in = None
+                # latest_energy_timestamp = None
+ 
+            # --- Prometheus & Hubitat publishing ---
+            for ct_name, metrics in all_metrics.items():
+                fields_to_write = {}
+                triggered_metrics = {}
+
+                for metric_name, value in metrics.items():
+                    key = f"{ct_name}_{metric_name}"
+
+                    # Determine if we should write to Prometheus
+                    filtered, pct_diff, abs_diff, reason = should_write(key, value, raw_value=value)
+                    if filtered is not None:
+                        fields_to_write[metric_name] = filtered
+                        triggered_metrics[metric_name] = reason
+
+                    # Store last value for backup purposes
+                    last_sent_values[key] = value
+
+                # --- Publish to Prometheus / Hubitat if any field triggered ---
+                if fields_to_write:
+                    # Push metrics to Prometheus. Unconditional (within this
+                    # block) and unchanged - it's an in-process gauge set,
+                    # costs nothing, and Grafana's resolution should not be
+                    # affected by the hub throttling below.
+                    power_metric.labels(ct_name=ct_name).set(metrics.get("power", 0.0))
+                    energy_metric.labels(ct_name=ct_name).set(metrics.get("energy_in", 0.0))
+                    if log_flags.get("log_grafana"):
+                        logger.info(f"Published to Grafana {ct_name}")
+
+                    # --- Publish to Hubitat, but only if it's worth waking
+                    # the hub for (see should_send_to_hubitat). This used to
+                    # fire on every Prometheus-worthy change, which is what
+                    # made MQTT Link the hub's largest CPU consumer. ---
+                    send_hub, hub_reason = should_send_to_hubitat(ct_name, metrics, now_time)
+                    if not send_hub:
+                        if log_flags.get("log_hubitat") or (log_flags.get("log_hubitat_dishwasher") and ct_name == "Dishwasher"):
+                            logger.info(f"[SKIP] Hubitat publish skipped for {ct_name}: {hub_reason}")
+                    else:
+                        # Counts Hubitat publishes specifically - it rides
+                        # along in the payload as "counter".
+                        if ct_name not in last_interval_count:
+                            last_interval_count[ct_name] = 0
+                        last_interval_count[ct_name] += 1
+
+                        hubitat_topic = f"{HUBITAT_TOPIC_PREFIX}/{ct_name}"
+                        hubitat_payload = json.dumps({
+                            "ct": ct_name,
+                            "power": round(metrics.get("power", 0.0), 3),
+                            "energy_in": round(metrics.get("energy_in", 0.0), 3),
+                            "counter":int(last_interval_count[ct_name]),
+                            "ts": int(now_time)
+                        })
+                        send_hubitat_counter+=1
+                        send_hubitat_counter = send_hubitat_counter%100
+
+                        #send hubitat mqtt message to broker with hubitat topic and hubitat is listening for
+                        client.publish(hubitat_topic, hubitat_payload, qos=1)
+                        hubitat_mqtt_counter += 1
+                        time.sleep(0.2)  # 200ms delay
+                        if log_flags.get("log_hubitat") or (log_flags.get("log_hubitat_dishwasher") and ct_name == "Dishwasher"):
+                            logger.info(f"[LIVE] Published to Hubitat → {hubitat_topic} ({hub_reason}): {hubitat_payload}")
+                        last_hubitat_values[ct_name] = {
+                            "power": metrics.get("power", 0.0),
+                            "energy_in": metrics.get("energy_in", 0.0),
+                        }
+                        # Only on an actual publish. Updating this on a
+                        # skip would tell both HUBITAT_MIN_INTERVAL and the
+                        # BACKUP_HUBITAT sweep that the hub had just been
+                        # told something, and a CT sitting quietly below the
+                        # deadband would never be sent again.
+                        last_hubitat_sent[ct_name] = now_time
+                    
+            # --- HUBITAT BACKUP (send all metrics every BACKUP_HUBITAT seconds) ---
+            if (now_time - last_hubitat_backup) >= BACKUP_HUBITAT:
+                last_hubitat_backup = now_time
+
+                if log_flags.get("log_hubitat"): 
+                    logger.info("Performing Hubitat backup for all CTs")
+
+                for ct_name, metrics in all_metrics.items():
+                    # Skip CTs that were sent recently (within the backup interval)
+                    last_sent = last_hubitat_sent.get(ct_name, 0)
+                    if now_time - last_sent < BACKUP_HUBITAT:
+                        continue  # no need to resend fresh data
+                        
+                    # Track count in interval
+                    if ct_name not in last_interval_count:
+                        last_interval_count[ct_name] = 0
+                    last_interval_count[ct_name] += 1    
+
+                    hubitat_topic = f"{HUBITAT_TOPIC_PREFIX}/{ct_name}"
+                    hubitat_payload = json.dumps({
+                        "ct": ct_name,
+                        "power": round(metrics.get("power", 0.0), 3),
+                        "energy_in": round(metrics.get("energy_in", 0.0), 3),
+                        "counter":int(last_interval_count[ct_name]),
+                        "ts": int(now_time)
+                    })
+                    # Push metrics to Prometheus
+                    power_metric.labels(ct_name=ct_name).set(metrics.get("power", 0.0))
+                    energy_metric.labels(ct_name=ct_name).set(metrics.get("energy_in", 0.0))
+                    if log_flags.get("log_grafana"): 
+                        logger.info(f"Published to Grafana {ct_name}")
+
+                    send_hubitat_counter+=1
+                    send_hubitat_counter = send_hubitat_counter%100
+                    
+                    #sending hubitat message to mqtt broker for hubitat to listen for 
+                    client.publish(hubitat_topic, hubitat_payload, qos=1)
+                    hubitat_mqtt_counter += 1
+                    time.sleep(0.2)  # 200ms delay
+                    if log_flags.get("log_hubitat"): 
+                        logger.info(f"[BACKUP] Published to Hubitat → {hubitat_topic}: {hubitat_payload}")
+
+                    # Update last send time, and the baseline the live
+                    # deadband measures against - without this second line
+                    # the heartbeat would keep sending fresh numbers while
+                    # should_send_to_hubitat() went on comparing against an
+                    # ever-older value, and would eventually fire on a
+                    # change the hub had already been told about.
+                    last_hubitat_sent[ct_name] = now_time
+                    last_hubitat_values[ct_name] = {
+                        "power": metrics.get("power", 0.0),
+                        "energy_in": metrics.get("energy_in", 0.0),
+                    }
+
+        except Exception as e:
+            logger.error("Error processing message:", exc_info=e)
+        finally:
+            msg_queue.task_done()
+
+
+def save_meter_state(meter_value, baseline, timestamp=None):
+    logger.info("save_meter_state called")
+    try:
+        state = {
+            "meter_value": meter_value,
+            "baseline": baseline,
+            "timestamp": timestamp or time.time(),
+        }
+        with open(STATE_FILE_PATH, "w") as f:
+            json.dump(state, f, indent=2)
+    except Exception as e:
+        logger.warning(f"Failed to save meter state: {e}")
+
+def load_meter_state():
+    logger.info(f"load_meter_state called")
+    global manual_timestamp, manual_energy_baseline, manual_meter_kwh
+    try:
+        with open(STATE_FILE_PATH, "r") as f:
+            state = json.load(f)
+            manual_timestamp = state.get("timestamp")
+            manual_energy_baseline = state.get("baseline")
+            manual_meter_kwh = state.get("meter_value")
+            logger.info(f"[MANUAL] Restored meter state: timestamp={manual_timestamp}, baseline={manual_energy_baseline}  manual_meter={manual_meter_kwh}")
+    except Exception as e:
+        logger.info(f"No previous meter state found or failed to load: {e}   timestamp={manual_timestamp}, baseline={manual_energy_baseline}  manual_meter={manual_meter_kwh}")
+
+def save_daily_state(date_str, baseline_kwh, cost_dollars=None, cost_last_energy=None):
+    try:
+        with open(DAILY_STATE_FILE_PATH, "w") as f:
+            json.dump({
+                "date": date_str,
+                "baseline_kwh": baseline_kwh,
+                "cost_dollars": cost_dollars,
+                "cost_last_energy": cost_last_energy,
+            }, f, indent=2)
+    except Exception as e:
+        logger.warning(f"Failed to save daily meter state: {e}")
+
+def load_daily_state():
+    global daily_baseline_date, daily_baseline_kwh, daily_cost_dollars, daily_cost_last_energy
+    try:
+        with open(DAILY_STATE_FILE_PATH, "r") as f:
+            state = json.load(f)
+            daily_baseline_date = state.get("date")
+            daily_baseline_kwh = state.get("baseline_kwh")
+            daily_cost_dollars = state.get("cost_dollars")
+            daily_cost_last_energy = state.get("cost_last_energy")
+            logger.info(f"[DAILY] Restored daily meter state: date={daily_baseline_date}, baseline={daily_baseline_kwh}, cost=${daily_cost_dollars}")
+    except Exception as e:
+        logger.info(f"No previous daily meter state found or failed to load: {e}")
+
+def watch_meter_file():
+    global manual_meter_kwh, manual_timestamp, manual_energy_baseline, latest_main_energy_in
+    last_mtime = os.path.getmtime(METER_FILE_PATH) 
+
+    while True:
+        try:
+            mtime = os.path.getmtime(METER_FILE_PATH)
+            if mtime != last_mtime:
+                last_mtime = mtime
+                with open(METER_FILE_PATH, "r", encoding="utf-8-sig") as f:
+                    manual_meter_kwh = float(f.read().strip())
+                    manual_timestamp = time.time()
+                    manual_energy_baseline = latest_main_energy_in
+                    logger.info(f"File changed  latest_main_energy_in {latest_main_energy_in}")
+                    logger.info(f"[MANUAL] Meter set to {manual_meter_kwh} kWh at {manual_timestamp}, baseline energy {manual_energy_baseline} kWh")
+                    save_meter_state(manual_meter_kwh,manual_energy_baseline,manual_timestamp)
+        except FileNotFoundError:
+            logger.warning(f"Meter file '{METER_FILE_PATH}' not found. Waiting for it to be created...")
+        except Exception as e:
+            logger.warning(f"Meter file read error: {e}")
+        time.sleep(1)
+
+
+def projected_meter_publisher():
+    global last_published, send_hubitat_counter, projected_ct_name
+    global daily_baseline_kwh, daily_baseline_date, last_published_daily
+    global daily_cost_dollars, daily_cost_last_energy, last_published_daily_cost
+    last_published  = None
+    latest_main_energy_in_last = None
+
+    while True:
+        log_flags = load_log_flags()
+
+        try:
+            if manual_meter_kwh is None or manual_energy_baseline is None or latest_main_energy_in is None:
+                time.sleep(1)
+                continue
+
+            if latest_main_energy_in is not None:
+                if latest_main_energy_in_last is None:
+                    latest_main_energy_in_last = latest_main_energy_in
+                elif latest_main_energy_in < latest_main_energy_in_last:   #went backwards
+                    logger.info(f"latest_main_energy_in {latest_main_energy_in} is less than old {latest_main_energy_in_last} - will update file with approx meter reading {last_published} and NEW energy_in {latest_main_energy_in}")
+                    save_meter_state(last_published, latest_main_energy_in)
+                    load_meter_state()
+                    latest_main_energy_in_last = latest_main_energy_in  # update after reset
+                else:
+                    latest_main_energy_in_last = latest_main_energy_in  # normal update
+
+            delta_energy = latest_main_energy_in - manual_energy_baseline
+            projected_meter = round(manual_meter_kwh + delta_energy,2)
+            if last_published is None:
+                last_published = projected_meter   #first time wont get published
+                continue
+            delta_since_last = projected_meter - last_published
+            if (log_flags.get("log_projected_last_delta") and (last_published is not None)):
+                logger.info(f"projected_meter_publisher change since last published: {delta_since_last:.2f} kWh")
+
+            if delta_since_last > 0.1:
+                if log_flags.get("log_projected"):
+                    logger.info(f" Meter value changed by 0.1 to {projected_meter:.2f}; publishing to Hubitat and Grafana Cloud.")
+                last_published = projected_meter
+                now_time = time.time()
+
+                # Push to Prometheus
+                energy_metric.labels(ct_name=projected_ct_name).set(projected_meter)
+
+                # Push to Hubitat
+                hubitat_topic = f"hubitat/sem_meter/{projected_ct_name}"
+
+                send_hubitat_counter+=1
+                send_hubitat_counter = send_hubitat_counter%100
+                
+                hubitat_payload = json.dumps({
+                        "ct": projected_ct_name,
+                        "power": 0,
+                        "energy_in": projected_meter,
+                        "counter":int(send_hubitat_counter),
+                        "ts": int(now_time)
+                })
+
+                client.publish(hubitat_topic, hubitat_payload, qos=1)
+
+            # --- Daily energy (resets at local midnight) ---
+            # Rides on projected_meter rather than raw CT energy_in, so it
+            # inherits projected_meter's own CT-reset recalibration for
+            # free instead of needing separate reset-detection here.
+            now_dt = datetime.now(central)
+            today_str = now_dt.strftime("%Y-%m-%d")
+            if daily_baseline_date != today_str:
+                daily_baseline_date = today_str
+                daily_baseline_kwh = projected_meter
+                # New day also resets the cost accumulator - the energy
+                # pointer is reset to the same starting point so the first
+                # cost delta of the new day is computed from here, not
+                # across the midnight boundary into yesterday's usage.
+                daily_cost_dollars = 0.0
+                daily_cost_last_energy = projected_meter
+                save_daily_state(daily_baseline_date, daily_baseline_kwh, daily_cost_dollars, daily_cost_last_energy)
+                logger.info(f"[DAILY] New day {today_str}, resetting daily baseline to {daily_baseline_kwh:.2f} kWh and cost to $0.00")
+
+            # Self-healing fallback for a pre-existing daily_meter_state.json
+            # that predates cost tracking (no cost_dollars/cost_last_energy
+            # keys) - the rollover block above only fires on an actual date
+            # change, so without this, loading an old-format file on a day
+            # that's already "current" would leave these None indefinitely
+            # (until the next real midnight) and crash every cycle instead.
+            if daily_cost_dollars is None:
+                daily_cost_dollars = 0.0
+                logger.info("[DAILY] cost_dollars was never initialized (old state file format) - starting today's cost from $0.00")
+            if daily_cost_last_energy is None:
+                daily_cost_last_energy = projected_meter
+
+            daily_energy_kwh = round(projected_meter - daily_baseline_kwh, 2)
+            if last_published_daily is None or abs(daily_energy_kwh - last_published_daily) >= 0.05:
+                last_published_daily = daily_energy_kwh
+                now_time = time.time()
+
+                # Push to Prometheus -> scraped by grafana-agent -> Grafana Cloud
+                energy_metric.labels(ct_name=daily_ct_name).set(daily_energy_kwh)
+
+                # Push to Hubitat / dashboard, same shape as every other CT
+                daily_topic = f"hubitat/sem_meter/{daily_ct_name}"
+                send_hubitat_counter += 1
+                send_hubitat_counter = send_hubitat_counter % 100
+                daily_payload = json.dumps({
+                        "ct": daily_ct_name,
+                        "power": 0,
+                        "energy_in": daily_energy_kwh,
+                        "counter": int(send_hubitat_counter),
+                        "ts": int(now_time)
+                })
+                client.publish(daily_topic, daily_payload, qos=1)
+                if log_flags.get("log_projected"):
+                    logger.info(f"[DAILY] Published {daily_energy_kwh:.2f} kWh used today to Hubitat and Grafana Cloud")
+
+            # --- Daily cost (resets at local midnight, same boundary as energy) ---
+            # Integrated incrementally rather than derived from
+            # daily_energy_kwh directly, since the $/kWh rate changes
+            # throughout the day - each cycle's own energy delta is
+            # multiplied by whatever rate is active *right now*, not
+            # whatever rate was active when the day started.
+            if daily_cost_last_energy is not None:
+                cost_delta_kwh = projected_meter - daily_cost_last_energy
+                if cost_delta_kwh > 0:
+                    rate = get_rate_per_kwh(now_dt)
+                    daily_cost_dollars = round(daily_cost_dollars + cost_delta_kwh * rate, 4)
+            daily_cost_last_energy = projected_meter
+
+            if last_published_daily_cost is None or abs(daily_cost_dollars - last_published_daily_cost) >= 0.01:
+                last_published_daily_cost = daily_cost_dollars
+                now_time = time.time()
+                save_daily_state(daily_baseline_date, daily_baseline_kwh, daily_cost_dollars, daily_cost_last_energy)
+
+                # Push to Prometheus -> scraped by grafana-agent -> Grafana Cloud
+                cost_metric.labels(ct_name=daily_cost_ct_name).set(daily_cost_dollars)
+
+                # Push to Hubitat / dashboard, same shape as every other CT -
+                # energy_in here means dollars, not kWh, purely by virtue of
+                # which CT name it's attached to (same repurposing trick as
+                # ProjectedMeter/DailyEnergy already use).
+                cost_topic = f"hubitat/sem_meter/{daily_cost_ct_name}"
+                send_hubitat_counter += 1
+                send_hubitat_counter = send_hubitat_counter % 100
+                cost_payload = json.dumps({
+                        "ct": daily_cost_ct_name,
+                        "power": 0,
+                        "energy_in": daily_cost_dollars,
+                        "counter": int(send_hubitat_counter),
+                        "ts": int(now_time)
+                })
+                client.publish(cost_topic, cost_payload, qos=1)
+                if log_flags.get("log_projected"):
+                    logger.info(f"[DAILY] Published ${daily_cost_dollars:.2f} spent today to Hubitat and Grafana Cloud")
+
+        except Exception as e:
+            logger.warning(f"Projection thread error: {e}")
+
+        time.sleep(10)
+
+def clear_counts_periodically(interval=300):  # 300 seconds = 5 minutes
+    global last_interval_count
+    while True:
+        time.sleep(interval)
+        print("Clearing counts...")
+        last_interval_count.clear()
+
+# --- MQTT callbacks ---
+def on_connect(client, userdata, flags, rc):
+    logger.info(f"Connected to MQTT broker {MQTT_BROKER} with code {rc}")
+    client.subscribe(MQTT_SUB_TOPIC, qos=1)
+
+def on_message(client, userdata, msg):
+#   msg_queue.put(msg.payload)
+    # Topic shape is SEMMETER/<device_id>/HA - record a sighting regardless
+    # of whether downstream processing (process_queue) succeeds, since the
+    # goal here is "did a message arrive", not "did we parse it cleanly".
+    parts = msg.topic.split("/")
+    if len(parts) >= 2 and parts[0] == "SEMMETER" and parts[1] in sem_last_seen:
+        sem_last_seen[parts[1]] = time.time()
+    msg_queue.put((msg.topic, msg.payload.decode()))
+
+# --- MQTT setup ---
+client_id = f"mqtt_prometheus_bridge_{uuid.uuid4().hex[:8]}"
+client = mqtt.Client(client_id=client_id, clean_session=False)
+client.on_connect = on_connect
+client.on_message = on_message
+
+try:
+    resolved_ip = socket.gethostbyname(MQTT_BROKER)
+    logger.info(f"Resolved {MQTT_BROKER} to {resolved_ip}")
+except Exception as e:
+    logger.warning("DNS resolution failed:", exc_info=e)
+
+logger.info(f"Connecting to MQTT broker at {MQTT_BROKER}:{MQTT_PORT}")
+try:
+    client.connect(MQTT_BROKER, MQTT_PORT, 60)
+except Exception as e:
+    logger.error("MQTT connect failed:", exc_info=e)
+
+client.reconnect_delay_set(min_delay=1, max_delay=30)
+client.loop_start()
+
+# --- Restore manual meter state ---
+load_meter_state()
+load_daily_state()
+
+# --- Start worker thread ---
+threading.Thread(target=process_queue, daemon=True).start()
+threading.Thread(target=watch_meter_file, daemon=True).start()
+threading.Thread(target=projected_meter_publisher, daemon=True).start()
+threading.Thread(target=log_counter, daemon=True).start()
+threading.Thread(target=clear_counts_periodically, daemon=True).start()
+threading.Thread(target=check_sem_staleness, daemon=True).start()
+threading.Thread(target=ping_healthcheck_loop, daemon=True).start()
+
+# --- Keep container alive ---
+try:
+    while True:
+        time.sleep(1)
+except KeyboardInterrupt:
+    logger.info("Stopping mqtt-prometheus-bridge...")

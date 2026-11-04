@@ -21,7 +21,7 @@ metadata {
 }
 
 def getDriverVersion() {
-    return "v1.0.1"  // Update this string as needed
+    return "v1.0.2"  // v1.0.2: mqttWatchdog collapses duplicate schedules (hub load fix)
     // only send burst of anyShown
 }
 
@@ -110,6 +110,16 @@ def reconnectMqtt() {
 }
 
 def mqttWatchdog() {
+    // Defensive self-heal (added 2026-10-14): confirmed live that duplicate
+    // copies of this same runEvery5Minutes schedule can pile up (13 seen
+    // after just ~4 hours of uptime, not weeks as first assumed), each one
+    // firing independently and pushing the hub toward severe load / Zigbee
+    // radio dropouts. Collapsing back to exactly one registration on every
+    // single run, regardless of how a duplicate got there, is cheap
+    // insurance against whatever the underlying scheduler quirk is.
+    unschedule("mqttWatchdog")
+    runEvery5Minutes("mqttWatchdog")
+
     if(!state.lastMsg) {
         // No messages yet — nothing to check
         return

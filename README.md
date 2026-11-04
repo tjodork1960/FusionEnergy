@@ -64,10 +64,14 @@ cp hubitat_sensor_bridge/hubitat_sensor_bridge.py.example \
 
 #### `mqtt_prometheus_bridge/mqtt_prometheus_bridge.py`
 - Replace `YOUR_SEM_DEVICE_MAC_1` / `YOUR_SEM_DEVICE_MAC_2` with your SEM device MAC addresses
-  (find these by watching MQTT traffic: `mosquitto_sub -t "SEMMETER/#" -v`)
+  everywhere they appear (find them by watching MQTT traffic: `mosquitto_sub -t "SEMMETER/#" -v`)
 - Fill in your circuit names for each CT channel (1–19). Use `"NA"` for unused channels.
 - Name paired circuits with `-A` / `-B` suffix — they are automatically merged:
   `Main-A` + `Main-B` → `Main`
+- Replace the example `RATE_*` electricity rates with your utility's, for the cost metrics.
+- Optional: email alerts when a meter goes silent, a dead-man's-switch ping, and
+  Hubitat send-rate tuning are all set through environment variables. See the
+  commented `environment:` block in `docker-compose.yml`.
 
 #### `hubitat_sensor_bridge/hubitat_sensor_bridge.py`
 - Replace `YOUR-HUB-ID` with your Hubitat hub ID
@@ -78,6 +82,7 @@ cp hubitat_sensor_bridge/hubitat_sensor_bridge.py.example \
 ```bash
 echo "0" > meter.txt
 echo "{}" > meter_state.json
+echo "{}" > daily_meter_state.json
 ```
 
 `meter.txt` anchors the projected meter reading. Update it with your actual meter kWh reading whenever you want to re-sync:
@@ -149,10 +154,32 @@ The bridge watches this file and updates automatically — no restart needed.
 
 The `HubitatDrivers/` folder contains Groovy drivers to install on your Hubitat hub:
 
-- **Fusion Energy Main** — parent driver, connects to MQTT and creates child devices per CT
-- **Fusion CT Child** — child driver, one per circuit, exposes power/energy attributes
+- **`Fusion_Energy_Main.groovy`** — parent driver, connects to MQTT and creates child devices per CT
+- **`Fusion_CT_Child.groovy`** — child driver, one per circuit, exposes power/energy attributes
 
-Install via: Hubitat → Drivers Code → New Driver → paste the Groovy code.
+Install via: Hubitat → Drivers Code → New Driver → paste the Groovy code. Install the
+CT Child driver too; the Main driver creates its child devices with it.
+
+**Already installed v1.0.1 or earlier? Update the Main driver to v1.0.2.** In earlier
+versions, copies of the 5-minute MQTT watchdog schedule could pile up (13 were seen
+after about 4 hours). Each copy runs on its own, which can push the hub into severe
+load and Zigbee radio dropouts. v1.0.2 resets the schedule to a single copy every
+time it runs. Check your version on the PowerMain device's `driverVersion` attribute.
+
+---
+
+## What's new (November 2026)
+
+- **Hubitat driver v1.0.2:** the MQTT watchdog duplicate-schedule fix described above.
+- **Full bridge programs published.** The `.example` files previously held only the
+  settings, not the programs, so the bridges couldn't actually run from this repo.
+- **Lower Hubitat load:** the bridge now forwards readings to Hubitat much less often
+  than to Prometheus (larger change thresholds, 30s minimum interval, a 100W spike
+  override, and a 10-minute heartbeat), all tunable via environment variables.
+- **Time-of-use cost metrics** with configurable rates.
+- **Optional alerts:** an email when a SEM meter stops publishing, and a
+  dead-man's-switch ping for the bridge itself.
+- `docker-compose.yml` now uses relative paths, so it runs from wherever you clone it.
 
 ---
 
@@ -184,6 +211,7 @@ FusionEnergy/
 ├── log_config.json
 ├── meter.txt                       ← your meter reading (gitignored)
 ├── meter_state.json                ← auto-managed (gitignored)
+├── daily_meter_state.json          ← auto-managed (gitignored)
 ├── mosquitto/
 │   └── config/mosquitto.conf
 ├── mqtt_prometheus_bridge/
@@ -197,7 +225,7 @@ FusionEnergy/
 │   ├── Dockerfile
 │   └── requirements.txt
 ├── HubitatDrivers/
-│   ├── Fusion Energy Main - Good.txt
-│   └── Fusion CT Child Good.txt
+│   ├── Fusion_Energy_Main.groovy
+│   └── Fusion_CT_Child.groovy
 └── wal/                            ← Grafana Agent buffer (gitignored)
 ```

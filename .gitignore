@@ -6,6 +6,7 @@ hubitat_sensor_bridge/hubitat_sensor_bridge.py
 # Personal meter readings
 meter.txt
 meter_state.json
+daily_meter_state.json
 
 # Runtime data
 mosquitto/data/
