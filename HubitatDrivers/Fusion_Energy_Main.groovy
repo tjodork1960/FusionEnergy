@@ -21,7 +21,7 @@ metadata {
 }
 
 def getDriverVersion() {
-    return "v1.0.2"  // v1.0.2: mqttWatchdog collapses duplicate schedules (hub load fix)
+    return "v1.0.3"  // v1.0.3: per-message log only with debug logging on; v1.0.2: mqttWatchdog collapses duplicate schedules (hub load fix)
     // only send burst of anyShown
 }
 
@@ -156,7 +156,9 @@ def parse(String message) {
         log.warn "Message false -exiting parse immediately"
         return
     } else {
-        log.info "Message received is ${message}"
+        // Debug only (v1.0.3): logged every message as INFO, ~6,000 base64
+        // lines a day in the hub log with no way to turn it off.
+        if (debugEnable) log.debug "Message received is ${message}"
     }
            
     /* TRACK LAST MSG TIMESTAMP */
